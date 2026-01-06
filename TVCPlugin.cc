@@ -44,7 +44,8 @@ const double SERVO_MAX_LEN = 0.115; // 115 mm
 
 class TVCPlugin : public System,
                   public ISystemConfigure,
-                  public ISystemPreUpdate
+                  public ISystemPreUpdate,
+                  public ISystemPostUpdate
 {
 public:
     TVCPlugin() :
@@ -117,6 +118,13 @@ public:
           gzmsg << "TVCPlugin configured for TVC model. Max Servo Speed: " << this->servo_max_speed_
               << " m/s. Servo time-constant: " << this->servo_time_constant_ << " s."
               << " MinLen: " << this->servo_min_len_ << " m MaxLen: " << this->servo_max_len_ << " m." << std::endl;
+
+          // Debug: print entity ids for the joints/links we found so it's clear we're
+          // operating on the expected entities.
+          gzmsg << "TVCPlugin entities - roll_joint: " << this->roll_joint_
+              << ", pitch_joint: " << this->pitch_joint_
+              << ", engine_link: " << this->engine_link_
+              << ", base_link: " << this->base_link_ << std::endl;
     }
 
     // ISystemPreUpdate
@@ -177,13 +185,18 @@ public:
         double roll_angle = -(this->servo1_current_len_ - L0_1) / r_roll; // Servo 1 controls Roll (X-axis rotation)
         double pitch_angle = (this->servo2_current_len_ - L0_2) / r_pitch; // Servo 2 controls Pitch (Y-axis rotation)
 
-        // Clamp angles to joint limits (-0.25 to 0.25 rad, from SDF)
-        roll_angle = std::clamp(roll_angle, -0.25, 0.25);
-        pitch_angle = std::clamp(pitch_angle, -0.25, 0.25);
+          // Clamp angles to joint limits (-0.25 to 0.25 rad, from SDF)
+          roll_angle = std::clamp(roll_angle, -0.25, 0.25);
+          pitch_angle = std::clamp(pitch_angle, -0.25, 0.25);
 
-        // --- 3. Set Joint Positions ---
-        _ecm.SetComponentData<components::JointPosition>(this->roll_joint_, {roll_angle});
-        _ecm.SetComponentData<components::JointPosition>(this->pitch_joint_, {pitch_angle});
+        // Debug: log computed angles so we can confirm PreUpdate is calculating values.
+        gzmsg << "TVCPlugin::PreUpdate - roll_angle: " << roll_angle
+              << ", pitch_angle: " << pitch_angle << std::endl;
+
+        // Store computed angles; apply them in PostUpdate to avoid ordering
+        // conflicts with physics systems.
+        this->last_roll_angle_ = roll_angle;
+        this->last_pitch_angle_ = pitch_angle;
         
         // --- 4. Thrust ---
         // Thrust is handled externally by gz-sim-multicopter-motor-model-system, no action needed here.
@@ -205,10 +218,27 @@ public:
         // Clamp the commanded length to the configured physical limits
         this->servo1_target_len_ = std::clamp(_msg.data(0), this->servo_min_len_, this->servo_max_len_);
         this->servo2_target_len_ = std::clamp(_msg.data(1), this->servo_min_len_, this->servo_max_len_);
-        // Debug: print received (and clamped) targets so we can confirm the plugin
-        // receives messages when running the simulator.
+    
+          // Debug: print received (and clamped) targets so we can confirm the plugin
+          // receives messages when running the simulator.
         gzmsg << "TVCPlugin::OnServoCommand - targets: "
-              << this->servo1_target_len_ << ", " << this->servo2_target_len_ << std::endl;
+            << this->servo1_target_len_ << ", " << this->servo2_target_len_ << std::endl;
+
+    }
+
+    // ISystemPostUpdate
+    virtual void PostUpdate(const UpdateInfo &_info,
+                            const EntityComponentManager &_ecm) override
+    {
+        // Apply joint positions in PostUpdate so they are not overwritten by
+        // physics or other systems that run in PreUpdate.
+        gzmsg << "TVCPlugin::PostUpdate - applying roll: " << this->last_roll_angle_
+              << ", pitch: " << this->last_pitch_angle_ << std::endl;
+
+        // _ecm is const here; cast away const to set components (common pattern)
+        auto &ecm = const_cast<EntityComponentManager &>(_ecm);
+        ecm.SetComponentData<components::JointPosition>(this->roll_joint_, {this->last_roll_angle_});
+        ecm.SetComponentData<components::JointPosition>(this->pitch_joint_, {this->last_pitch_angle_});
     }
 
 private:
@@ -231,7 +261,10 @@ private:
     double servo2_current_len_;
     double servo1_target_len_;  // The "commanded" length from Python
     double servo2_target_len_;
+    // Last computed joint angles (set in PreUpdate, applied in PostUpdate)
+    double last_roll_angle_ = 0.0;
+    double last_pitch_angle_ = 0.0;
 };
 
 // Register the plugin
-GZ_ADD_PLUGIN(TVCPlugin, gz::sim::System, gz::sim::ISystemConfigure, gz::sim::ISystemPreUpdate)
+GZ_ADD_PLUGIN(TVCPlugin, gz::sim::System, gz::sim::ISystemConfigure, gz::sim::ISystemPreUpdate, gz::sim::ISystemPostUpdate)
