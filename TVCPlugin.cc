@@ -205,6 +205,10 @@ public:
         // Clamp the commanded length to the configured physical limits
         this->servo1_target_len_ = std::clamp(_msg.data(0), this->servo_min_len_, this->servo_max_len_);
         this->servo2_target_len_ = std::clamp(_msg.data(1), this->servo_min_len_, this->servo_max_len_);
+        // Debug: print received (and clamped) targets so we can confirm the plugin
+        // receives messages when running the simulator.
+        gzmsg << "TVCPlugin::OnServoCommand - targets: "
+              << this->servo1_target_len_ << ", " << this->servo2_target_len_ << std::endl;
     }
 
 private:
