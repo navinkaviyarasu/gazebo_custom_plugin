@@ -1,0 +1,31 @@
+# Build artifacts
+/build/
+
+# CMake files
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+
+# Object files and libraries
+*.o
+*.obj
+*.so
+*.a
+*.dll
+
+# Editor directories and OS files
+.vscode/
+.idea/
+*~
+.DS_Store
+
+# Backup and temporary files
+*.swp
+*.tmp
+
+# Logs
+*.log
+
+# Other
+/.vs/
+.pytest_cache/
