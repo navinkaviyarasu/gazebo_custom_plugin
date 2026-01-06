@@ -10,8 +10,8 @@
 #include <gz/sim/components/Model.hh>
 #include <gz/sim/components/Name.hh>
 #include <gz/sim/components/Sensor.hh>
-#include <gz/sim/components/Pose.hh> // Needed for link poses
 #include <gz/sim/components/JointPosition.hh>
+#include <gz/sim/components/Pose.hh> // Needed for link poses
 
 #include <gz/transport/Node.hh>
 #include <gz/msgs/double_v.pb.h> // Using Double_V for a 2-vector of servo lengths
@@ -20,7 +20,6 @@
 #include <gz/math/Pose3.hh>
 #include <cmath>
 #include <algorithm>
-#include <gz/plugin/Register.hh>
 
 using namespace gz;
 using namespace sim;
@@ -52,7 +51,10 @@ public:
         servo1_current_len_(0.0),
         servo2_current_len_(0.0),
         servo1_target_len_(0.0),
-        servo2_target_len_(0.0)
+        servo2_target_len_(0.0),
+        servo_time_constant_(0.0),
+        servo_min_len_(SERVO_MIN_LEN),
+        servo_max_len_(SERVO_MAX_LEN)
     {
     }
 
@@ -72,6 +74,12 @@ public:
         // --- Get parameters from SDF ---
         // MightyZap 12LF-12PT-27: 112 mm/s = 0.112 m/s
         this->servo_max_speed_ = _sdf->Get<double>("servo_max_speed", 0.112).first; // m/s
+        // First-order time constant (seconds) for servo dynamics. If <= 0, plugin
+        // falls back to the original rate-limiter behavior.
+        this->servo_time_constant_ = _sdf->Get<double>("servo_time_constant", 0.1).first; // seconds
+        // Read servo physical limits from SDF (fall back to compile-time constants)
+        this->servo_min_len_ = _sdf->Get<double>("servo_min_len", SERVO_MIN_LEN).first;
+        this->servo_max_len_ = _sdf->Get<double>("servo_max_len", SERVO_MAX_LEN).first;
         
         // --- Joint/Link setup ---
         std::string roll_joint_name = _sdf->Get<std::string>("roll_joint", "servo0_roll_joint").first;
@@ -106,32 +114,48 @@ public:
         std::string topic_name = _sdf->Get<std::string>("topic", "/tvc_servo_command").first;
         this->gz_node_.Subscribe(topic_name, &TVCPlugin::OnServoCommand, this);
         
-        gzmsg << "TVCPlugin configured for TVC model. Max Servo Speed: " << this->servo_max_speed_ << " m/s." << std::endl;
+          gzmsg << "TVCPlugin configured for TVC model. Max Servo Speed: " << this->servo_max_speed_
+              << " m/s. Servo time-constant: " << this->servo_time_constant_ << " s."
+              << " MinLen: " << this->servo_min_len_ << " m MaxLen: " << this->servo_max_len_ << " m." << std::endl;
     }
 
     // ISystemPreUpdate
     virtual void PreUpdate(const UpdateInfo &_info,
                            EntityComponentManager &_ecm) override
     {
-        // Don't run if simulation is paused or physics isn't on
-        // if (_info.paused || !_info.simTime)
-        if (_info.paused || _info.simTime.count() == 0)
-
+        // Don't run if simulation is paused or simulation time is zero
+        if (_info.paused || _info.simTime == std::chrono::steady_clock::duration::zero())
         {
             return;
         }
 
         double dt = std::chrono::duration<double>(_info.dt).count();
 
-        // --- 1. Apply Actuator Dynamics (Slew Rate) ---
-        // Rate limit the servo length command by max linear speed
-        double max_change = this->servo_max_speed_ * dt;
-        
-        double s1_error = this->servo1_target_len_ - this->servo1_current_len_;
-        this->servo1_current_len_ += std::clamp(s1_error, -max_change, max_change);
-        
-        double s2_error = this->servo2_target_len_ - this->servo2_current_len_;
-        this->servo2_current_len_ += std::clamp(s2_error, -max_change, max_change);
+        // --- 1. Apply Actuator Dynamics (First-order model) ---
+        // If a positive time constant is provided, use a first-order system:
+        //   dL/dt = (L_target - L) / tau
+        // Optionally clamp the derivative to the physical max speed.
+        if (this->servo_time_constant_ > 0.0)
+        {
+            double s1_dot = (this->servo1_target_len_ - this->servo1_current_len_) / this->servo_time_constant_;
+            double s2_dot = (this->servo2_target_len_ - this->servo2_current_len_) / this->servo_time_constant_;
+
+            double max_speed = this->servo_max_speed_; // m/s
+            s1_dot = std::clamp(s1_dot, -max_speed, max_speed);
+            s2_dot = std::clamp(s2_dot, -max_speed, max_speed);
+
+            this->servo1_current_len_ += s1_dot * dt;
+            this->servo2_current_len_ += s2_dot * dt;
+        }
+        else
+        {
+            // Fallback: pure rate limiter behavior (previous implementation)
+            double max_change = this->servo_max_speed_ * dt;
+            double s1_error = this->servo1_target_len_ - this->servo1_current_len_;
+            this->servo1_current_len_ += std::clamp(s1_error, -max_change, max_change);
+            double s2_error = this->servo2_target_len_ - this->servo2_current_len_;
+            this->servo2_current_len_ += std::clamp(s2_error, -max_change, max_change);
+        }
 
         // --- 2. Inverse Kinematics (Servo Lengths -> Gimbal Angles) ---
         
@@ -160,9 +184,6 @@ public:
         // --- 3. Set Joint Positions ---
         _ecm.SetComponentData<components::JointPosition>(this->roll_joint_, {roll_angle});
         _ecm.SetComponentData<components::JointPosition>(this->pitch_joint_, {pitch_angle});
-        // _ecm.SetComponentData<components::JointPositionCmd>(this->roll_joint_, roll_angle);
-        // _ecm.SetComponentData<components::JointPositionCmd>(this->pitch_joint_, pitch_angle);
-
         
         // --- 4. Thrust ---
         // Thrust is handled externally by gz-sim-multicopter-motor-model-system, no action needed here.
@@ -181,9 +202,9 @@ public:
         // Value 0: Desired length for Servo 1 (controls Roll)
         // Value 1: Desired length for Servo 2 (controls Pitch)
         
-        // Clamp the commanded length to the physical limits of the MightyZap 12LF-12PT-27
-        this->servo1_target_len_ = std::clamp(_msg.data(0), SERVO_MIN_LEN, SERVO_MAX_LEN);
-        this->servo2_target_len_ = std::clamp(_msg.data(1), SERVO_MIN_LEN, SERVO_MAX_LEN);
+        // Clamp the commanded length to the configured physical limits
+        this->servo1_target_len_ = std::clamp(_msg.data(0), this->servo_min_len_, this->servo_max_len_);
+        this->servo2_target_len_ = std::clamp(_msg.data(1), this->servo_min_len_, this->servo_max_len_);
     }
 
 private:
@@ -197,6 +218,9 @@ private:
     
     // --- Parameters ---
     double servo_max_speed_; // m/s (0.112 m/s for MightyZap 12LF-12PT-27)
+    double servo_time_constant_; // seconds (tau) for first-order servo model
+    double servo_min_len_; // meters (configurable via SDF)
+    double servo_max_len_; // meters (configurable via SDF)
     
     // --- State ---
     double servo1_current_len_; // The "real" simulated length
@@ -206,13 +230,4 @@ private:
 };
 
 // Register the plugin
-// GZ_PLUGIN_REGISTER_CLASS(
-//     TVCPlugin
-// )
-
-GZ_ADD_PLUGIN(
-  TVCPlugin,
-  gz::sim::System,
-  TVCPlugin::ISystemConfigure,
-  TVCPlugin::ISystemPreUpdate
-)
+GZ_ADD_PLUGIN(TVCPlugin, gz::sim::System, gz::sim::ISystemConfigure, gz::sim::ISystemPreUpdate)
