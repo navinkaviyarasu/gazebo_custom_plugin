@@ -14,16 +14,36 @@
 #include <gz/sim/components/Pose.hh> // Needed for link poses
 
 #include <gz/transport/Node.hh>
-#include <gz/msgs/double_v.pb.h> // Using Double_V for a 2-vector of servo lengths
+#include <gz/msgs/double.pb.h>     // For single servo commands
+#include <gz/msgs/double_v.pb.h>   // Using Double_V for a 2-vector of servo lengths
 
 #include <gz/math/Vector3.hh>
 #include <gz/math/Pose3.hh>
 #include <cmath>
 #include <algorithm>
+#include <memory>
 
 using namespace gz;
 using namespace sim;
 using namespace systems;
+
+// --- Input Format Enumeration ---
+enum class InputFormat {
+    NORMALIZED_MINUS1_1,  // PX4 normalized [-1, 1] range (DEFAULT)
+    PWM_1000_2000,        // Standard RC PWM range
+    SERVO_LENGTH,         // Direct servo length command
+    JOINT_ANGLE           // Direct joint angle
+};
+
+// --- Gimbal Kinematics Structure ---
+struct GimbalKinematics {
+    std::string model;        // "linear" or "detailed"
+    // Linear model parameters
+    double roll_moment_arm;   // meters
+    double pitch_moment_arm;  // meters
+    double neutral_length_roll;   // meters
+    double neutral_length_pitch;  // meters
+};
 
 // --- Kinematic Parameters in Meters ---
 // Servo fixed anchor points (on base_link/gimbal_mount)
@@ -60,8 +80,20 @@ public:
         servo_damping_ratio_(0.7),
         dynamics_model_("first_order"),
         servo_min_len_(SERVO_MIN_LEN),
-        servo_max_len_(SERVO_MAX_LEN)
+        servo_max_len_(SERVO_MAX_LEN),
+        input_mode_("joint_position"),
+        input_format_(InputFormat::NORMALIZED_MINUS1_1),
+        servo_0_topic_("/gazebo/servo_0"),
+        servo_1_topic_("/gazebo/servo_1"),
+        transport_topic_("/tvc_servo_command"),
+        servo_0_command_(0.0),
+        servo_1_command_(0.0)
     {
+        gimbal_kinematics_.model = "linear";
+        gimbal_kinematics_.roll_moment_arm = 0.05;
+        gimbal_kinematics_.pitch_moment_arm = 0.05;
+        gimbal_kinematics_.neutral_length_roll = 0.10;
+        gimbal_kinematics_.neutral_length_pitch = 0.10;
     }
 
     // ISystemConfigure
@@ -106,6 +138,36 @@ public:
             this->dynamics_model_ = "first_order";
         }
         
+        // --- Input Mode Configuration ---
+        this->input_mode_ = _sdf->Get<std::string>("input_mode", "joint_position").first;
+        std::string input_format_str = _sdf->Get<std::string>("input_format", "normalized_minus1_1").first;
+        
+        if (input_format_str == "normalized_minus1_1")
+            this->input_format_ = InputFormat::NORMALIZED_MINUS1_1;
+        else if (input_format_str == "pwm_1000_2000")
+            this->input_format_ = InputFormat::PWM_1000_2000;
+        else if (input_format_str == "servo_length")
+            this->input_format_ = InputFormat::SERVO_LENGTH;
+        else if (input_format_str == "joint_angle")
+            this->input_format_ = InputFormat::JOINT_ANGLE;
+        else
+        {
+            gzwarn << "Unknown input_format: '" << input_format_str << "'. Using 'normalized_minus1_1'." << std::endl;
+            this->input_format_ = InputFormat::NORMALIZED_MINUS1_1;
+        }
+        
+        // --- Servo Topic Configuration ---
+        this->servo_0_topic_ = _sdf->Get<std::string>("servo_0_topic", "/gazebo/servo_0").first;
+        this->servo_1_topic_ = _sdf->Get<std::string>("servo_1_topic", "/gazebo/servo_1").first;
+        this->transport_topic_ = _sdf->Get<std::string>("transport_topic", "/tvc_servo_command").first;
+        
+        // --- Gimbal Kinematics Configuration ---
+        this->gimbal_kinematics_.model = _sdf->Get<std::string>("gimbal_kinematics_model", "linear").first;
+        this->gimbal_kinematics_.roll_moment_arm = _sdf->Get<double>("roll_moment_arm", 0.05).first;
+        this->gimbal_kinematics_.pitch_moment_arm = _sdf->Get<double>("pitch_moment_arm", 0.05).first;
+        this->gimbal_kinematics_.neutral_length_roll = _sdf->Get<double>("neutral_length_roll", 0.10).first;
+        this->gimbal_kinematics_.neutral_length_pitch = _sdf->Get<double>("neutral_length_pitch", 0.10).first;
+        
         // --- Joint/Link setup ---
         std::string roll_joint_name = _sdf->Get<std::string>("roll_joint", "servo0_roll_joint").first;
         std::string pitch_joint_name = _sdf->Get<std::string>("pitch_joint", "servo1_pitch_joint").first; // Universal joint uses 'pitch' on top of 'roll'
@@ -135,9 +197,33 @@ public:
         this->servo1_target_len_ = this->servo1_current_len_;
         this->servo2_target_len_ = this->servo2_current_len_;
 
-        // --- Setup Gazebo Transport Subscriber ---
-        std::string topic_name = _sdf->Get<std::string>("topic", "/tvc_servo_command").first;
-        this->gz_node_.Subscribe(topic_name, &TVCPlugin::OnServoCommand, this);
+        // --- Setup Gazebo Transport Subscribers ---
+        if (this->input_mode_ == "joint_position")
+        {
+            // Subscribe to PX4 servo command topics
+            this->servo_0_node_ = std::make_unique<transport::Node>();
+            this->servo_1_node_ = std::make_unique<transport::Node>();
+            this->servo_0_node_->Subscribe(this->servo_0_topic_, &TVCPlugin::OnServo0Command, this);
+            this->servo_1_node_->Subscribe(this->servo_1_topic_, &TVCPlugin::OnServo1Command, this);
+            gzmsg << "TVCPlugin input mode: joint_position" << std::endl;
+            gzmsg << "  Servo 0 topic: " << this->servo_0_topic_ << std::endl;
+            gzmsg << "  Servo 1 topic: " << this->servo_1_topic_ << std::endl;
+        }
+        else if (this->input_mode_ == "transport_topic")
+        {
+            // Subscribe to custom transport topic (backward compatible)
+            this->gz_node_.Subscribe(this->transport_topic_, &TVCPlugin::OnServoCommand, this);
+            gzmsg << "TVCPlugin input mode: transport_topic (legacy)" << std::endl;
+            gzmsg << "  Topic: " << this->transport_topic_ << std::endl;
+        }
+        else
+        {
+            gzwarn << "Unknown input_mode: '" << this->input_mode_ << "'. Using 'joint_position'." << std::endl;
+            this->servo_0_node_ = std::make_unique<transport::Node>();
+            this->servo_1_node_ = std::make_unique<transport::Node>();
+            this->servo_0_node_->Subscribe(this->servo_0_topic_, &TVCPlugin::OnServo0Command, this);
+            this->servo_1_node_->Subscribe(this->servo_1_topic_, &TVCPlugin::OnServo1Command, this);
+        }
         
           gzmsg << "TVCPlugin configured for TVC model. Max Servo Speed: " << this->servo_max_speed_
               << " m/s. Servo time-constant: " << this->servo_time_constant_ << " s."
@@ -149,6 +235,12 @@ public:
               gzmsg << "  Natural Frequency: " << this->servo_natural_freq_ 
                     << " rad/s, Damping Ratio: " << this->servo_damping_ratio_ << std::endl;
           }
+          
+          gzmsg << "Gimbal Kinematics Model: " << this->gimbal_kinematics_.model << std::endl;
+          gzmsg << "  Roll moment arm: " << this->gimbal_kinematics_.roll_moment_arm << " m" << std::endl;
+          gzmsg << "  Pitch moment arm: " << this->gimbal_kinematics_.pitch_moment_arm << " m" << std::endl;
+          gzmsg << "  Neutral length (roll): " << this->gimbal_kinematics_.neutral_length_roll << " m" << std::endl;
+          gzmsg << "  Neutral length (pitch): " << this->gimbal_kinematics_.neutral_length_pitch << " m" << std::endl;
 
           // Debug: print entity ids for the joints/links we found so it's clear we're
           // operating on the expected entities.
@@ -189,28 +281,36 @@ public:
         }
 
         // --- 2. Inverse Kinematics (Servo Lengths -> Gimbal Angles) ---
+        double roll_angle = 0.0;
+        double pitch_angle = 0.0;
         
-        // Use the initial calculated neutral lengths (L0)
-        math::Vector3d delta1_neutral = ANCHOR_1 - CLEVIS_1_NEUTRAL;
-        double L0_1 = delta1_neutral.Length();
-        
-        math::Vector3d delta2_neutral = ANCHOR_2 - CLEVIS_2_NEUTRAL;
-        double L0_2 = delta2_neutral.Length();
+        if (this->gimbal_kinematics_.model == "linear")
+        {
+            // Linear kinematics model using moment arms and neutral lengths
+            roll_angle = (this->servo1_current_len_ - this->gimbal_kinematics_.neutral_length_roll) 
+                         / this->gimbal_kinematics_.roll_moment_arm;
+            pitch_angle = (this->servo2_current_len_ - this->gimbal_kinematics_.neutral_length_pitch) 
+                          / this->gimbal_kinematics_.pitch_moment_arm;
+        }
+        else
+        {
+            // Fallback to detailed geometric kinematics (original hardcoded method)
+            math::Vector3d delta1_neutral = ANCHOR_1 - CLEVIS_1_NEUTRAL;
+            double L0_1 = delta1_neutral.Length();
+            
+            math::Vector3d delta2_neutral = ANCHOR_2 - CLEVIS_2_NEUTRAL;
+            double L0_2 = delta2_neutral.Length();
 
-        // Effective moment arm for Roll/Pitch based on geometry.
-        // We use an average of the anchor/clevis lateral offsets for a simple linear model.
-        double r_roll = (ANCHOR_1.Y() + CLEVIS_1_NEUTRAL.Y()) / 2.0; 
-        double r_pitch = (ANCHOR_2.X() + CLEVIS_2_NEUTRAL.X()) / 2.0; 
-        
-        // Approximate Kinematics (Change in length -> Angle)
-        // delta_L ~ r * theta => theta ~ delta_L / r
-        // Note the negative sign for roll to align length extension with positive joint angle
-        double roll_angle = -(this->servo1_current_len_ - L0_1) / r_roll; // Servo 1 controls Roll (X-axis rotation)
-        double pitch_angle = (this->servo2_current_len_ - L0_2) / r_pitch; // Servo 2 controls Pitch (Y-axis rotation)
+            double r_roll = (ANCHOR_1.Y() + CLEVIS_1_NEUTRAL.Y()) / 2.0; 
+            double r_pitch = (ANCHOR_2.X() + CLEVIS_2_NEUTRAL.X()) / 2.0; 
+            
+            roll_angle = -(this->servo1_current_len_ - L0_1) / r_roll;
+            pitch_angle = (this->servo2_current_len_ - L0_2) / r_pitch;
+        }
 
-          // Clamp angles to joint limits (-0.25 to 0.25 rad, from SDF)
-          roll_angle = std::clamp(roll_angle, -0.25, 0.25);
-          pitch_angle = std::clamp(pitch_angle, -0.25, 0.25);
+        // Clamp angles to joint limits (-0.25 to 0.25 rad, from SDF)
+        roll_angle = std::clamp(roll_angle, -0.25, 0.25);
+        pitch_angle = std::clamp(pitch_angle, -0.25, 0.25);
 
         // Debug: log computed angles so we can confirm PreUpdate is calculating values.
         gzmsg << "TVCPlugin::PreUpdate - roll_angle: " << roll_angle
@@ -292,7 +392,97 @@ public:
         current_len = std::clamp(current_len, this->servo_min_len_, this->servo_max_len_);
     }
 
-    // Callback for Gazebo Transport topic
+    // Callback for PX4 Servo 0 command (Roll control)
+    void OnServo0Command(const msgs::Double &_msg)
+    {
+        // Extract normalized [-1, 1] input from PX4
+        this->servo_0_command_ = _msg.data();
+        
+        // Convert input format to servo length target
+        this->servo1_target_len_ = ConvertInputToServoLength(this->servo_0_command_, 0);
+        
+        gzmsg << "TVCPlugin::OnServo0Command - input: " << this->servo_0_command_ 
+              << ", target_len: " << this->servo1_target_len_ << std::endl;
+    }
+
+    // Callback for PX4 Servo 1 command (Pitch control)
+    void OnServo1Command(const msgs::Double &_msg)
+    {
+        // Extract normalized [-1, 1] input from PX4
+        this->servo_1_command_ = _msg.data();
+        
+        // Convert input format to servo length target
+        this->servo2_target_len_ = ConvertInputToServoLength(this->servo_1_command_, 1);
+        
+        gzmsg << "TVCPlugin::OnServo1Command - input: " << this->servo_1_command_ 
+              << ", target_len: " << this->servo2_target_len_ << std::endl;
+    }
+
+    // Helper: Convert input value (format-specific) to servo length target
+    // servo_index: 0 for servo1 (roll), 1 for servo2 (pitch)
+    double ConvertInputToServoLength(double input_value, int servo_index)
+    {
+        double target_len = 0.0;
+        
+        switch (this->input_format_)
+        {
+            case InputFormat::NORMALIZED_MINUS1_1:
+            {
+                // PX4 normalized [-1, 1] format
+                // Convert to servo length: L_target = (min + max)/2 + input * (max - min)/2
+                double mid_len = (this->servo_min_len_ + this->servo_max_len_) / 2.0;
+                double range = (this->servo_max_len_ - this->servo_min_len_) / 2.0;
+                target_len = mid_len + input_value * range;
+                break;
+            }
+            case InputFormat::PWM_1000_2000:
+            {
+                // Traditional RC PWM [1000, 2000] format
+                // Map 1000-2000 to servo_min_len to servo_max_len
+                double pwm_value = input_value; // already PWM value in callback
+                target_len = this->servo_min_len_ + 
+                             (pwm_value - 1000.0) / 1000.0 * 
+                             (this->servo_max_len_ - this->servo_min_len_);
+                break;
+            }
+            case InputFormat::SERVO_LENGTH:
+            {
+                // Direct servo length command
+                target_len = input_value;
+                break;
+            }
+            case InputFormat::JOINT_ANGLE:
+            {
+                // Direct joint angle command - convert to servo length using inverse kinematics
+                // For linear model: L = neutral_len + angle * moment_arm
+                if (servo_index == 0)
+                {
+                    target_len = this->gimbal_kinematics_.neutral_length_roll + 
+                                 input_value * this->gimbal_kinematics_.roll_moment_arm;
+                }
+                else
+                {
+                    target_len = this->gimbal_kinematics_.neutral_length_pitch + 
+                                 input_value * this->gimbal_kinematics_.pitch_moment_arm;
+                }
+                break;
+            }
+            default:
+            {
+                // Fallback to normalized
+                double mid_len = (this->servo_min_len_ + this->servo_max_len_) / 2.0;
+                double range = (this->servo_max_len_ - this->servo_min_len_) / 2.0;
+                target_len = mid_len + input_value * range;
+                break;
+            }
+        }
+        
+        // Clamp to physical servo limits
+        target_len = std::clamp(target_len, this->servo_min_len_, this->servo_max_len_);
+        return target_len;
+    }
+
+    // Callback for legacy Gazebo Transport topic
     void OnServoCommand(const msgs::Double_V &_msg)
     {
         if (_msg.data_size() < 2)
@@ -359,6 +549,22 @@ private:
     // Last computed joint angles (set in PreUpdate, applied in PostUpdate)
     double last_roll_angle_ = 0.0;
     double last_pitch_angle_ = 0.0;
+    
+    // --- Input Configuration (New) ---
+    std::string input_mode_;  // "joint_position" or "transport_topic"
+    InputFormat input_format_; // Format of input commands
+    std::string servo_0_topic_; // Topic for Servo 0 (Roll)
+    std::string servo_1_topic_; // Topic for Servo 1 (Pitch)
+    std::string transport_topic_; // Legacy transport topic
+    double servo_0_command_; // Last command from servo 0 topic
+    double servo_1_command_; // Last command from servo 1 topic
+    
+    // --- Gimbal Kinematics Configuration (New) ---
+    GimbalKinematics gimbal_kinematics_;
+    
+    // --- PX4 Transport Nodes (New) ---
+    std::unique_ptr<transport::Node> servo_0_node_;
+    std::unique_ptr<transport::Node> servo_1_node_;
 };
 
 // Register the plugin
