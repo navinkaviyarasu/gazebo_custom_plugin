@@ -53,7 +53,12 @@ public:
         servo2_current_len_(0.0),
         servo1_target_len_(0.0),
         servo2_target_len_(0.0),
+        servo1_velocity_(0.0),
+        servo2_velocity_(0.0),
         servo_time_constant_(0.0),
+        servo_natural_freq_(5.0),
+        servo_damping_ratio_(0.7),
+        dynamics_model_("first_order"),
         servo_min_len_(SERVO_MIN_LEN),
         servo_max_len_(SERVO_MAX_LEN)
     {
@@ -81,6 +86,25 @@ public:
         // Read servo physical limits from SDF (fall back to compile-time constants)
         this->servo_min_len_ = _sdf->Get<double>("servo_min_len", SERVO_MIN_LEN).first;
         this->servo_max_len_ = _sdf->Get<double>("servo_max_len", SERVO_MAX_LEN).first;
+        
+        // --- Dynamics Model Selection ---
+        // Choose between "first_order" (default) or "second_order"
+        this->dynamics_model_ = _sdf->Get<std::string>("dynamics_model", "first_order").first;
+        
+        // --- Second-order system parameters ---
+        // Natural frequency (rad/s) for second-order model. Typical range: 2-10 rad/s
+        this->servo_natural_freq_ = _sdf->Get<double>("servo_natural_freq", 5.0).first;
+        // Damping ratio (dimensionless). 0.7 is slightly underdamped (minimal overshoot)
+        // <1: underdamped, =1: critically damped, >1: overdamped
+        this->servo_damping_ratio_ = _sdf->Get<double>("servo_damping_ratio", 0.7).first;
+        
+        // Validate dynamics model selection
+        if (this->dynamics_model_ != "first_order" && this->dynamics_model_ != "second_order")
+        {
+            gzwarn << "Invalid dynamics_model: '" << this->dynamics_model_ 
+                   << "'. Using 'first_order' as default." << std::endl;
+            this->dynamics_model_ = "first_order";
+        }
         
         // --- Joint/Link setup ---
         std::string roll_joint_name = _sdf->Get<std::string>("roll_joint", "servo0_roll_joint").first;
@@ -118,6 +142,13 @@ public:
           gzmsg << "TVCPlugin configured for TVC model. Max Servo Speed: " << this->servo_max_speed_
               << " m/s. Servo time-constant: " << this->servo_time_constant_ << " s."
               << " MinLen: " << this->servo_min_len_ << " m MaxLen: " << this->servo_max_len_ << " m." << std::endl;
+          
+          gzmsg << "Dynamics Model: " << this->dynamics_model_ << std::endl;
+          if (this->dynamics_model_ == "second_order")
+          {
+              gzmsg << "  Natural Frequency: " << this->servo_natural_freq_ 
+                    << " rad/s, Damping Ratio: " << this->servo_damping_ratio_ << std::endl;
+          }
 
           // Debug: print entity ids for the joints/links we found so it's clear we're
           // operating on the expected entities.
@@ -139,30 +170,22 @@ public:
 
         double dt = std::chrono::duration<double>(_info.dt).count();
 
-        // --- 1. Apply Actuator Dynamics (First-order model) ---
-        // If a positive time constant is provided, use a first-order system:
-        //   dL/dt = (L_target - L) / tau
-        // Optionally clamp the derivative to the physical max speed.
-        if (this->servo_time_constant_ > 0.0)
+        // --- 1. Apply Actuator Dynamics (First or Second-order model) ---
+        if (this->dynamics_model_ == "second_order")
         {
-            double s1_dot = (this->servo1_target_len_ - this->servo1_current_len_) / this->servo_time_constant_;
-            double s2_dot = (this->servo2_target_len_ - this->servo2_current_len_) / this->servo_time_constant_;
-
-            double max_speed = this->servo_max_speed_; // m/s
-            s1_dot = std::clamp(s1_dot, -max_speed, max_speed);
-            s2_dot = std::clamp(s2_dot, -max_speed, max_speed);
-
-            this->servo1_current_len_ += s1_dot * dt;
-            this->servo2_current_len_ += s2_dot * dt;
+            // Second-order system dynamics
+            this->ApplySecondOrderDynamics(this->servo1_current_len_, this->servo1_velocity_, 
+                                          this->servo1_target_len_, dt);
+            this->ApplySecondOrderDynamics(this->servo2_current_len_, this->servo2_velocity_, 
+                                          this->servo2_target_len_, dt);
         }
         else
         {
-            // Fallback: pure rate limiter behavior (previous implementation)
-            double max_change = this->servo_max_speed_ * dt;
-            double s1_error = this->servo1_target_len_ - this->servo1_current_len_;
-            this->servo1_current_len_ += std::clamp(s1_error, -max_change, max_change);
-            double s2_error = this->servo2_target_len_ - this->servo2_current_len_;
-            this->servo2_current_len_ += std::clamp(s2_error, -max_change, max_change);
+            // First-order system dynamics (default)
+            this->ApplyFirstOrderDynamics(this->servo1_current_len_, this->servo1_velocity_,
+                                         this->servo1_target_len_, dt);
+            this->ApplyFirstOrderDynamics(this->servo2_current_len_, this->servo2_velocity_,
+                                         this->servo2_target_len_, dt);
         }
 
         // --- 2. Inverse Kinematics (Servo Lengths -> Gimbal Angles) ---
@@ -200,6 +223,73 @@ public:
         
         // --- 4. Thrust ---
         // Thrust is handled externally by gz-sim-multicopter-motor-model-system, no action needed here.
+    }
+
+    // First-order system dynamics: dL/dt = (L_target - L) / tau
+    void ApplyFirstOrderDynamics(double &current_len, double &velocity, 
+                                  double target_len, double dt)
+    {
+        if (this->servo_time_constant_ > 0.0)
+        {
+            double error = target_len - current_len;
+            double desired_dot = error / this->servo_time_constant_;
+            
+            // Clamp velocity to physical max speed
+            double max_speed = this->servo_max_speed_; // m/s
+            velocity = std::clamp(desired_dot, -max_speed, max_speed);
+            
+            current_len += velocity * dt;
+        }
+        else
+        {
+            // Fallback: pure rate limiter behavior (previous implementation)
+            double max_change = this->servo_max_speed_ * dt;
+            double error = target_len - current_len;
+            current_len += std::clamp(error, -max_change, max_change);
+            velocity = (current_len - target_len) / (dt > 0 ? dt : 1.0);
+        }
+        
+        // Clamp length to physical limits
+        current_len = std::clamp(current_len, this->servo_min_len_, this->servo_max_len_);
+    }
+
+    // Second-order system dynamics using RK2 integration
+    // d²L/dt² + 2*zeta*wn*dL/dt + wn²*L = wn²*L_target
+    void ApplySecondOrderDynamics(double &current_len, double &velocity, 
+                                   double target_len, double dt)
+    {
+        double wn = this->servo_natural_freq_;   // Natural frequency (rad/s)
+        double zeta = this->servo_damping_ratio_; // Damping ratio
+        double max_speed = this->servo_max_speed_;
+        
+        // RK2 method for improved numerical stability
+        // State: [L, v] where v = dL/dt
+        // Derivatives: dL/dt = v, dv/dt = wn²(L_target - L) - 2*zeta*wn*v
+        
+        // Stage 1: compute initial derivatives
+        double k1_L = velocity;
+        double k1_v = wn * wn * (target_len - current_len) - 2.0 * zeta * wn * velocity;
+        
+        // Clamp velocity derivative to avoid numerical instability
+        k1_v = std::clamp(k1_v, -max_speed * 10.0, max_speed * 10.0);
+        
+        // Stage 2: compute mid-point derivatives
+        double mid_L = current_len + 0.5 * dt * k1_L;
+        double mid_v = velocity + 0.5 * dt * k1_v;
+        
+        double k2_L = mid_v;
+        double k2_v = wn * wn * (target_len - mid_L) - 2.0 * zeta * wn * mid_v;
+        k2_v = std::clamp(k2_v, -max_speed * 10.0, max_speed * 10.0);
+        
+        // Update state using RK2 result
+        current_len += dt * k2_L;
+        velocity += dt * k2_v;
+        
+        // Clamp velocity to max speed
+        velocity = std::clamp(velocity, -max_speed, max_speed);
+        
+        // Clamp length to physical limits
+        current_len = std::clamp(current_len, this->servo_min_len_, this->servo_max_len_);
     }
 
     // Callback for Gazebo Transport topic
@@ -253,6 +343,9 @@ private:
     // --- Parameters ---
     double servo_max_speed_; // m/s (0.112 m/s for MightyZap 12LF-12PT-27)
     double servo_time_constant_; // seconds (tau) for first-order servo model
+    double servo_natural_freq_; // rad/s for second-order system (natural frequency)
+    double servo_damping_ratio_; // dimensionless for second-order system (zeta)
+    std::string dynamics_model_; // "first_order" or "second_order"
     double servo_min_len_; // meters (configurable via SDF)
     double servo_max_len_; // meters (configurable via SDF)
     
@@ -261,6 +354,8 @@ private:
     double servo2_current_len_;
     double servo1_target_len_;  // The "commanded" length from Python
     double servo2_target_len_;
+    double servo1_velocity_; // Velocity state for second-order dynamics
+    double servo2_velocity_;
     // Last computed joint angles (set in PreUpdate, applied in PostUpdate)
     double last_roll_angle_ = 0.0;
     double last_pitch_angle_ = 0.0;
