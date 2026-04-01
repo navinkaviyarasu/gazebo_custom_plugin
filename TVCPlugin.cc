@@ -11,6 +11,7 @@
 #include <gz/sim/components/Name.hh>
 #include <gz/sim/components/Sensor.hh>
 #include <gz/sim/components/JointPosition.hh>
+#include <gz/sim/components/JointVelocity.hh>
 #include <gz/sim/components/Pose.hh>
 
 #include <gz/transport/Node.hh>
@@ -485,6 +486,21 @@ public:
                                          this->servo2_target_len_, dt);
         }
 
+        // STABILITY DEADZONE: Snap servo lengths to target if within tolerance
+        // This prevents oscillation from floating-point precision errors
+        // when servo length is very close to target but not exactly equal
+        const double servo_length_deadzone = 1e-6;  // 1 micrometer deadzone
+        if (std::abs(this->servo1_current_len_ - this->servo1_target_len_) < servo_length_deadzone)
+        {
+            this->servo1_current_len_ = this->servo1_target_len_;
+            this->servo1_velocity_ = 0.0;  // Zero velocity when snapped to target
+        }
+        if (std::abs(this->servo2_current_len_ - this->servo2_target_len_) < servo_length_deadzone)
+        {
+            this->servo2_current_len_ = this->servo2_target_len_;
+            this->servo2_velocity_ = 0.0;  // Zero velocity when snapped to target
+        }
+
         // --- 2. Inverse Kinematics (Servo Lengths -> Gimbal Angles) ---
         // Use real gimbal kinematics with Levenberg-Marquardt solver
         double theta = 0.0;  // Roll angle (X axis)
@@ -505,10 +521,11 @@ public:
         
         if (!ik_converged)
         {
-            // Log convergence issue but continue with best effort result
-            gzmsg << "TVCPlugin: InverseKinematics did not converge. "
-                  << "L3=" << this->servo1_current_len_
-                  << ", L6=" << this->servo2_current_len_ << std::endl;
+            // Log convergence issue but only occasionally to avoid spam
+            // Uncomment for debugging:
+            // gzmsg << "TVCPlugin: InverseKinematics did not converge. "
+            //       << "L3=" << this->servo1_current_len_
+            //       << ", L6=" << this->servo2_current_len_ << std::endl;
         }
 
         // Clamp angles to joint limits for safety
@@ -516,9 +533,44 @@ public:
         theta = std::clamp(theta, -0.25, 0.25);
         phi = std::clamp(phi, -0.25, 0.25);
 
+        // Anti-jitter filtering: if angle change is very small, keep previous value
+        // This prevents oscillation from IK numerical precision issues
+        const double jitter_threshold = 1e-4;  // 0.01 degrees (increased from 1e-5 for more stability)
+        if (std::abs(theta - this->last_roll_angle_) < jitter_threshold)
+        {
+            theta = this->last_roll_angle_;
+        }
+        if (std::abs(phi - this->last_pitch_angle_) < jitter_threshold)
+        {
+            phi = this->last_pitch_angle_;
+        }
+
+        // Rate limiter: prevent sudden angle jumps that excite oscillation
+        // Max angular velocity: 0.5 rad/s (reduced from 1.0 for smoother response during transients)
+        const double max_angle_velocity = 0.5;  // rad/s
+        double angle_rate_limit = max_angle_velocity * dt;
+        
+        double dtheta = theta - this->last_roll_angle_;
+        if (std::abs(dtheta) > angle_rate_limit)
+        {
+            theta = this->last_roll_angle_ + std::clamp(dtheta, -angle_rate_limit, angle_rate_limit);
+        }
+        
+        double dphi = phi - this->last_pitch_angle_;
+        if (std::abs(dphi) > angle_rate_limit)
+        {
+            phi = this->last_pitch_angle_ + std::clamp(dphi, -angle_rate_limit, angle_rate_limit);
+        }
+        
+        // SMOOTHING FILTER: Apply exponential moving average (low-pass filter)
+        // This smooths out high-frequency oscillation from IK solver during transients
+        // while still allowing the gimbal to track commanded angles
+        this->filtered_roll_angle_ = angle_filter_alpha_ * theta + (1.0 - angle_filter_alpha_) * this->filtered_roll_angle_;
+        this->filtered_pitch_angle_ = angle_filter_alpha_ * phi + (1.0 - angle_filter_alpha_) * this->filtered_pitch_angle_;
+
         // Store computed angles; apply them in PostUpdate to avoid ordering conflicts
-        this->last_roll_angle_ = theta;
-        this->last_pitch_angle_ = phi;
+        this->last_roll_angle_ = this->filtered_roll_angle_;
+        this->last_pitch_angle_ = this->filtered_pitch_angle_;
         
         // --- 4. Thrust ---
         // Thrust is handled externally by gz-sim-multicopter-motor-model-system, no action needed here.
@@ -538,6 +590,16 @@ public:
             velocity = std::clamp(desired_dot, -max_speed, max_speed);
             
             current_len += velocity * dt;
+            
+            // STABILITY: If velocity is essentially zero and error is tiny, snap to target
+            // to prevent oscillation from floating-point precision issues
+            const double velocity_threshold = 1e-8;  // m/s
+            const double error_threshold = 1e-8;     // meters
+            if (std::abs(velocity) < velocity_threshold && std::abs(error) < error_threshold)
+            {
+                current_len = target_len;
+                velocity = 0.0;
+            }
         }
         else
         {
@@ -586,6 +648,17 @@ public:
         
         // Clamp velocity to max speed
         velocity = std::clamp(velocity, -max_speed, max_speed);
+        
+        // STABILITY: If velocity is essentially zero and error is tiny, snap to target
+        // to prevent oscillation from floating-point precision issues
+        const double velocity_threshold = 1e-8;  // m/s
+        const double error_threshold = 1e-8;     // meters
+        double error = target_len - current_len;
+        if (std::abs(velocity) < velocity_threshold && std::abs(error) < error_threshold)
+        {
+            current_len = target_len;
+            velocity = 0.0;
+        }
         
         // Clamp length to physical limits
         current_len = std::clamp(current_len, this->servo_min_len_, this->servo_max_len_);
@@ -730,13 +803,18 @@ public:
     {
         // Apply joint positions in PostUpdate so they are not overwritten by
         // physics or other systems that run in PreUpdate.
-        gzmsg << "TVCPlugin::PostUpdate - applying roll: " << this->last_roll_angle_
-              << ", pitch: " << this->last_pitch_angle_ << std::endl;
-
+        // IMPORTANT: Also set velocity to zero to prevent oscillation
+        // When setting position without velocity, Gazebo physics oscillates to correct the mismatch
+        
         // _ecm is const here; cast away const to set components (common pattern)
         auto &ecm = const_cast<EntityComponentManager &>(_ecm);
+        
+        // Set both position AND velocity to prevent physics oscillation
         ecm.SetComponentData<components::JointPosition>(this->roll_joint_, {this->last_roll_angle_});
+        ecm.SetComponentData<components::JointVelocity>(this->roll_joint_, {0.0});
+        
         ecm.SetComponentData<components::JointPosition>(this->pitch_joint_, {this->last_pitch_angle_});
+        ecm.SetComponentData<components::JointVelocity>(this->pitch_joint_, {0.0});
     }
 
 private:
@@ -767,6 +845,13 @@ private:
     // Last computed joint angles (set in PreUpdate, applied in PostUpdate)
     double last_roll_angle_ = 0.0;
     double last_pitch_angle_ = 0.0;
+    // Filtered angles (exponential moving average low-pass filter)
+    // Used to smooth out high-frequency oscillation during transients
+    double filtered_roll_angle_ = 0.0;
+    double filtered_pitch_angle_ = 0.0;
+    static constexpr double angle_filter_alpha_ = 0.3;  // EMA filter coefficient (0.0-1.0)
+                                                         // Lower = more smoothing, slower response
+                                                         // Higher = less smoothing, faster response
     
     // --- Input Configuration (New) ---
     std::string input_mode_;  // "joint_position" or "transport_topic"
