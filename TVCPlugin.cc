@@ -365,7 +365,7 @@ public:
         this->servo_calibration_.L6_min = _sdf->Get<double>("servo_L6_min", DEFAULT_CALIBRATION.L6_min).first;
         this->servo_calibration_.L6_max = _sdf->Get<double>("servo_L6_max", DEFAULT_CALIBRATION.L6_max).first;
         
-        // --- Joint/Link setup ---
+        // --- Joint/Link setup (kept for legacy compatibility, but not used) ---
         std::string roll_joint_name = _sdf->Get<std::string>("roll_joint", "servo0_roll_joint").first;
         std::string pitch_joint_name = _sdf->Get<std::string>("pitch_joint", "servo1_pitch_joint").first;
         std::string engine_link_name = _sdf->Get<std::string>("engine_link", "motor_housing").first;
@@ -377,11 +377,25 @@ public:
         // Get base_link for anchor transform (base_link/gimbal_mount is fixed to the rocket body)
         this->base_link_ = this->model_.LinkByName(_ecm, "base_link"); 
 
-        if (this->roll_joint_ == kNullEntity || this->pitch_joint_ == kNullEntity || this->engine_link_ == kNullEntity || this->base_link_ == kNullEntity)
+        if (this->engine_link_ == kNullEntity || this->base_link_ == kNullEntity)
         {
-            gzerr << "Could not find all required joints/links (roll_joint, pitch_joint, motor_housing, base_link). Check SDF names." << std::endl;
+            gzerr << "Could not find required links (motor_housing, base_link). Check SDF names." << std::endl;
             return;
         }
+        
+        // --- Angle Output Topics (for JointPositionController) ---
+        this->roll_angle_topic_ = _sdf->Get<std::string>("roll_angle_topic", "/gazebo/gimbal/roll_angle").first;
+        this->pitch_angle_topic_ = _sdf->Get<std::string>("pitch_angle_topic", "/gazebo/gimbal/pitch_angle").first;
+        
+        // Create publishers for angle setpoints
+        auto roll_pub = this->gz_node_.Advertise<msgs::Double>(this->roll_angle_topic_);
+        auto pitch_pub = this->gz_node_.Advertise<msgs::Double>(this->pitch_angle_topic_);
+        this->roll_angle_pub_ = std::make_unique<transport::Node::Publisher>(roll_pub);
+        this->pitch_angle_pub_ = std::make_unique<transport::Node::Publisher>(pitch_pub);
+        
+        gzmsg << "TVCPlugin angle topic setup:" << std::endl;
+        gzmsg << "  Roll angle topic: " << this->roll_angle_topic_ << std::endl;
+        gzmsg << "  Pitch angle topic: " << this->pitch_angle_topic_ << std::endl;
         
         // Initialize neutral lengths using real gimbal geometry
         ComputeNeutralLengths(this->gimbal_geometry_, 
@@ -801,20 +815,20 @@ public:
     virtual void PostUpdate(const UpdateInfo &_info,
                             const EntityComponentManager &_ecm) override
     {
-        // Apply joint positions in PostUpdate so they are not overwritten by
-        // physics or other systems that run in PreUpdate.
-        // IMPORTANT: Also set velocity to zero to prevent oscillation
-        // When setting position without velocity, Gazebo physics oscillates to correct the mismatch
+        // Publish computed angle setpoints to topics for JointPositionController to consume
+        if (this->roll_angle_pub_)
+        {
+            msgs::Double roll_msg;
+            roll_msg.set_data(this->last_roll_angle_);
+            this->roll_angle_pub_->Publish(roll_msg);
+        }
         
-        // _ecm is const here; cast away const to set components (common pattern)
-        auto &ecm = const_cast<EntityComponentManager &>(_ecm);
-        
-        // Set both position AND velocity to prevent physics oscillation
-        ecm.SetComponentData<components::JointPosition>(this->roll_joint_, {this->last_roll_angle_});
-        ecm.SetComponentData<components::JointVelocity>(this->roll_joint_, {0.0});
-        
-        ecm.SetComponentData<components::JointPosition>(this->pitch_joint_, {this->last_pitch_angle_});
-        ecm.SetComponentData<components::JointVelocity>(this->pitch_joint_, {0.0});
+        if (this->pitch_angle_pub_)
+        {
+            msgs::Double pitch_msg;
+            pitch_msg.set_data(this->last_pitch_angle_);
+            this->pitch_angle_pub_->Publish(pitch_msg);
+        }
     }
 
 private:
@@ -861,6 +875,12 @@ private:
     std::string transport_topic_; // Legacy transport topic
     double servo_0_command_; // Last command from servo 0 topic
     double servo_1_command_; // Last command from servo 1 topic
+    
+    // --- Angle Output Topics (for JointPositionController) ---
+    std::string roll_angle_topic_;  // Topic to publish roll angle setpoint
+    std::string pitch_angle_topic_; // Topic to publish pitch angle setpoint
+    std::unique_ptr<transport::Node::Publisher> roll_angle_pub_;
+    std::unique_ptr<transport::Node::Publisher> pitch_angle_pub_;
     
     // --- Gimbal Geometry & Calibration (Real Kinematics) ---
     GimbalGeometry gimbal_geometry_;
