@@ -408,13 +408,17 @@ public:
         gzmsg << "[INIT] Neutral servo lengths: L3=" << std::fixed << std::setprecision(6) 
               << neutral_L3 << " m, L6=" << neutral_L6 << " m" << std::endl;
         
-        // Keep current and target lengths at 0.0 until first input is received
-        // This ensures gimbal stays at zero angles until commanded otherwise
-        this->servo1_current_len_ = 0.0;
-        this->servo2_current_len_ = 0.0;
-        this->servo1_target_len_ = 0.0;
-        this->servo2_target_len_ = 0.0;
+        // Initialize current servo lengths to neutral (physical equilibrium)
+        // This ensures kinematics are valid at startup and gimbal is at zero angles
+        // Keep target lengths at neutral too, so no motion occurs at startup
+        this->servo1_current_len_ = neutral_L3;
+        this->servo2_current_len_ = neutral_L6;
+        this->servo1_target_len_ = neutral_L3;  // Target = current = neutral initially
+        this->servo2_target_len_ = neutral_L6;
         this->has_received_input_ = false;
+        
+        gzmsg << "[INIT] Initialized servo current/target to neutral: " 
+              << "L3=" << neutral_L3 << "m, L6=" << neutral_L6 << "m" << std::endl;
 
         // --- Setup Gazebo Transport Subscribers ---
         if (this->input_mode_ == "joint_position")
