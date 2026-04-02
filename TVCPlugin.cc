@@ -65,8 +65,8 @@ struct ServoCalibration {
 
 // --- Default Kinematic Parameters ---
 // MightyZap 12LF-12PT-27 Servo Physical Limits
-const double SERVO_MIN_LEN = 0.085; // 85 mm
-const double SERVO_MAX_LEN = 0.115; // 115 mm
+const double SERVO_MIN_LEN = 0.108; // 85 mm
+const double SERVO_MAX_LEN = 0.135; // 115 mm
 
 // Default Viper gimbal geometry (from pwm_to_angles.py)
 const GimbalGeometry DEFAULT_GEOMETRY = {
@@ -80,11 +80,12 @@ const GimbalGeometry DEFAULT_GEOMETRY = {
 };
 
 // Default servo calibration (27mm stroke MightyZap)
+// Matches tvc_model.py calibration approach
 const ServoCalibration DEFAULT_CALIBRATION = {
-    .a3 = 0.0225,    // 22.5 mm per 1000 µs PWM
-    .a6 = 0.0225,    // 22.5 mm per 1000 µs PWM
-    .p01 = 1500.0,   // Neutral PWM
-    .p02 = 1500.0,   // Neutral PWM
+    .a3 = 0.0135,    // 13.5 mm per unit normalized input (±1.0 maps to ±13.5 mm stroke)
+    .a6 = 0.0135,    // 13.5 mm per unit normalized input
+    .p01 = 0.0,      // Neutral reference (normalized input, not PWM)
+    .p02 = 0.0,      // Neutral reference (normalized input, not PWM)
     .L3_min = SERVO_MIN_LEN,
     .L3_max = SERVO_MAX_LEN,
     .L6_min = SERVO_MIN_LEN,
@@ -399,11 +400,21 @@ public:
         gzmsg << "  Pitch angle topic: " << this->pitch_angle_topic_ << std::endl;
         
         // Initialize neutral lengths using real gimbal geometry
-        ComputeNeutralLengths(this->gimbal_geometry_, 
-                             this->servo1_current_len_, 
-                             this->servo2_current_len_);
-        this->servo1_target_len_ = this->servo1_current_len_;
-        this->servo2_target_len_ = this->servo2_current_len_;
+        // BUT: Keep target lengths at 0.0 (neutral command) until input is received
+        // Compute what the neutral servo lengths are for reference, but don't use them yet
+        double neutral_L3, neutral_L6;
+        ComputeNeutralLengths(this->gimbal_geometry_, neutral_L3, neutral_L6);
+        
+        gzmsg << "[INIT] Neutral servo lengths: L3=" << std::fixed << std::setprecision(6) 
+              << neutral_L3 << " m, L6=" << neutral_L6 << " m" << std::endl;
+        
+        // Keep current and target lengths at 0.0 until first input is received
+        // This ensures gimbal stays at zero angles until commanded otherwise
+        this->servo1_current_len_ = 0.0;
+        this->servo2_current_len_ = 0.0;
+        this->servo1_target_len_ = 0.0;
+        this->servo2_target_len_ = 0.0;
+        this->has_received_input_ = false;
 
         // --- Setup Gazebo Transport Subscribers ---
         if (this->input_mode_ == "joint_position")
@@ -490,6 +501,12 @@ public:
     {
         // Don't run if simulation is paused or simulation time is zero
         if (_info.paused || _info.simTime == std::chrono::steady_clock::duration::zero())
+        {
+            return;
+        }
+        
+        // Don't process kinematics until we receive input
+        if (!this->has_received_input_)
         {
             return;
         }
@@ -709,119 +726,92 @@ public:
     // Callback for PX4 Servo 0 command (Roll control)
     void OnServo0Command(const msgs::Double &_msg)
     {
+        this->has_received_input_ = true;  // Mark that we've received input
         static int call_count = 0;
         call_count++;
         
         // Extract normalized [-1, 1] input from PX4
         this->servo_0_command_ = _msg.data();
         
+        // Compute neutral lengths for debugging
+        double L3_neutral, L6_neutral;
+        ComputeNeutralLengths(this->gimbal_geometry_, L3_neutral, L6_neutral);
+        
         // Convert input format to servo length target
         this->servo1_target_len_ = ConvertInputToServoLength(this->servo_0_command_, 0);
         
-        gzmsg << "[SERVO_0] CALLBACK TRIGGERED (#" << call_count << ") Input: " << std::fixed << std::setprecision(6)
-              << this->servo_0_command_ 
-              << " -> Target Length: " << this->servo1_target_len_ 
-              << " m" << std::endl;
+        if (call_count <= 3)  // Log first 3 commands to verify
+        {
+            gzmsg << "[SERVO_0] CALLBACK #" << call_count << " Input: " << std::fixed << std::setprecision(6)
+                  << this->servo_0_command_ << " (Neutral L3=" << L3_neutral << "m)"
+                  << " -> Target Length: " << this->servo1_target_len_ << " m" << std::endl;
+        }
     }
 
     // Callback for PX4 Servo 1 command (Pitch control)
     void OnServo1Command(const msgs::Double &_msg)
     {
+        this->has_received_input_ = true;  // Mark that we've received input
         static int call_count = 0;
         call_count++;
         
         // Extract normalized [-1, 1] input from PX4
         this->servo_1_command_ = _msg.data();
         
+        // Compute neutral lengths for debugging
+        double L3_neutral, L6_neutral;
+        ComputeNeutralLengths(this->gimbal_geometry_, L3_neutral, L6_neutral);
+        
         // Convert input format to servo length target
         this->servo2_target_len_ = ConvertInputToServoLength(this->servo_1_command_, 1);
         
-        gzmsg << "[SERVO_1] CALLBACK TRIGGERED (#" << call_count << ") Input: " << std::fixed << std::setprecision(6)
-              << this->servo_1_command_ 
-              << " -> Target Length: " << this->servo2_target_len_ 
-              << " m" << std::endl;
+        if (call_count <= 3)  // Log first 3 commands to verify
+        {
+            gzmsg << "[SERVO_1] CALLBACK #" << call_count << " Input: " << std::fixed << std::setprecision(6)
+                  << this->servo_1_command_ << " (Neutral L6=" << L6_neutral << "m)"
+                  << " -> Target Length: " << this->servo2_target_len_ << " m" << std::endl;
+        }
     }
 
-    // Helper: Convert input value (format-specific) to servo length target
-    // Uses real calibration parameters for accurate conversion
-    // servo_index: 0 for servo1 (pitch), 1 for servo2 (roll)
+    // Helper: Convert normalized input to servo length target
+    // Simplified to match tvc_model.py approach:
+    // L_target = L_neutral + a_cal * (input - p_neutral)
+    // Where input is in [-1, 1] range, and a_cal is in meters (e.g., 0.0135m for ±13.5mm stroke)
     double ConvertInputToServoLength(double input_value, int servo_index)
     {
-        double target_len = 0.0;
+        // Compute neutral servo lengths from geometry
+        double L3_neutral, L6_neutral;
+        ComputeNeutralLengths(this->gimbal_geometry_, L3_neutral, L6_neutral);
+        
+        // Get calibration parameters for this servo
         double L_neutral, a_cal, p_neutral, L_min, L_max;
         
-        // Get parameters for this servo
-        if (servo_index == 0)  // Servo 1 (pitch)
+        if (servo_index == 0)  // Servo 1 (pitch control via L3)
         {
+            L_neutral = L3_neutral;
             a_cal = this->servo_calibration_.a3;
             p_neutral = this->servo_calibration_.p01;
             L_min = this->servo_calibration_.L3_min;
             L_max = this->servo_calibration_.L3_max;
         }
-        else  // Servo 2 (roll)
+        else  // Servo 2 (roll control via L6)
         {
+            L_neutral = L6_neutral;
             a_cal = this->servo_calibration_.a6;
             p_neutral = this->servo_calibration_.p02;
             L_min = this->servo_calibration_.L6_min;
             L_max = this->servo_calibration_.L6_max;
         }
         
-        // Compute neutral lengths from geometry
-        double L3_neutral, L6_neutral;
-        ComputeNeutralLengths(this->gimbal_geometry_, L3_neutral, L6_neutral);
-        L_neutral = (servo_index == 0) ? L3_neutral : L6_neutral;
+        // Direct formula (matching tvc_model.py):
+        // L_target = L_neutral + a_cal * (input_value - p_neutral)
+        // Since input_value is normalized [-1, 1] and p_neutral=0, this becomes:
+        // L_target = L_neutral + a_cal * input_value
+        double target_len = L_neutral + a_cal * (input_value - p_neutral);
         
-        switch (this->input_format_)
-        {
-            case InputFormat::NORMALIZED_MINUS1_1:
-            {
-                // PX4 normalized [-1, 1] format
-                // Convert normalized to PWM range: PWM = p_neutral + input * 500 µs
-                // (±1 maps to ±500 µs from neutral, standard RC convention)
-                double pwm_value = p_neutral + input_value * 500.0;
-                // Clamp PWM to valid range
-                pwm_value = std::clamp(pwm_value, p_neutral - 500.0, p_neutral + 500.0);
-                // Convert PWM to servo length using calibration formula:
-                // L_target = L_neutral + a * (pwm - p_neutral)
-                target_len = L_neutral + a_cal * (pwm_value - p_neutral);
-                break;
-            }
-            case InputFormat::PWM_1000_2000:
-            {
-                // Traditional RC PWM [1000, 2000] format
-                // L_target = L_neutral + a * (pwm - p_neutral)
-                double pwm_value = input_value;
-                pwm_value = std::clamp(pwm_value, 1000.0, 2000.0);
-                target_len = L_neutral + a_cal * (pwm_value - p_neutral);
-                break;
-            }
-            case InputFormat::SERVO_LENGTH:
-            {
-                // Direct servo length command (already in meters)
-                target_len = input_value;
-                break;
-            }
-            case InputFormat::JOINT_ANGLE:
-            {
-                // Direct joint angle command
-                // This is more complex - would need forward kinematics to convert angle to length
-                // For now, use a simple approximation: L = L_neutral + angle * scale_factor
-                double angle_scale = (servo_index == 0) ? L3_neutral * 0.02 : L6_neutral * 0.02;
-                target_len = L_neutral + input_value * angle_scale;
-                break;
-            }
-            default:
-            {
-                // Fallback to normalized
-                double pwm_value = p_neutral + input_value * 500.0;
-                pwm_value = std::clamp(pwm_value, p_neutral - 500.0, p_neutral + 500.0);
-                target_len = L_neutral + a_cal * (pwm_value - p_neutral);
-                break;
-            }
-        }
-        
-        // Clamp to physical servo limits
+        // Clamp to physical limits
         target_len = std::clamp(target_len, L_min, L_max);
+        
         return target_len;
     }
 
@@ -853,6 +843,12 @@ public:
     virtual void PostUpdate(const UpdateInfo &_info,
                             const EntityComponentManager &_ecm) override
     {
+        // Only publish angles after receiving at least one input command
+        if (!this->has_received_input_)
+        {
+            return;  // Don't publish until we get input
+        }
+        
         // Publish computed angle setpoints to topics for JointPositionController to consume
         static int publish_counter = 0;
         if (this->roll_angle_pub_)
@@ -931,6 +927,7 @@ private:
     std::string transport_topic_; // Legacy transport topic
     double servo_0_command_; // Last command from servo 0 topic
     double servo_1_command_; // Last command from servo 1 topic
+    bool has_received_input_ = false; // Track if any input command has been received
     
     // --- Angle Output Topics (for JointPositionController) ---
     std::string roll_angle_topic_;  // Topic to publish roll angle setpoint
