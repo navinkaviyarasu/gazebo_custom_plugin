@@ -24,6 +24,7 @@
 #include <cmath>
 #include <algorithm>
 #include <memory>
+#include <iomanip>
 
 using namespace gz;
 using namespace sim;
@@ -410,8 +411,15 @@ public:
             // Subscribe to PX4 servo command topics
             this->servo_0_node_ = std::make_unique<transport::Node>();
             this->servo_1_node_ = std::make_unique<transport::Node>();
-            this->servo_0_node_->Subscribe(this->servo_0_topic_, &TVCPlugin::OnServo0Command, this);
-            this->servo_1_node_->Subscribe(this->servo_1_topic_, &TVCPlugin::OnServo1Command, this);
+            
+            gzmsg << "[SUBSCRIBE] Attempting to subscribe to Servo 0 topic: " << this->servo_0_topic_ << std::endl;
+            bool sub0_ok = this->servo_0_node_->Subscribe(this->servo_0_topic_, &TVCPlugin::OnServo0Command, this);
+            gzmsg << "[SUBSCRIBE] Servo 0 subscription result: " << (sub0_ok ? "SUCCESS" : "FAILED") << std::endl;
+            
+            gzmsg << "[SUBSCRIBE] Attempting to subscribe to Servo 1 topic: " << this->servo_1_topic_ << std::endl;
+            bool sub1_ok = this->servo_1_node_->Subscribe(this->servo_1_topic_, &TVCPlugin::OnServo1Command, this);
+            gzmsg << "[SUBSCRIBE] Servo 1 subscription result: " << (sub1_ok ? "SUCCESS" : "FAILED") << std::endl;
+            
             gzmsg << "TVCPlugin input mode: joint_position" << std::endl;
             gzmsg << "  Servo 0 topic: " << this->servo_0_topic_ << std::endl;
             gzmsg << "  Servo 1 topic: " << this->servo_1_topic_ << std::endl;
@@ -419,6 +427,7 @@ public:
         else if (this->input_mode_ == "transport_topic")
         {
             // Subscribe to custom transport topic (backward compatible)
+            gzmsg << "[SUBSCRIBE] Subscribing to legacy transport topic: " << this->transport_topic_ << std::endl;
             this->gz_node_.Subscribe(this->transport_topic_, &TVCPlugin::OnServoCommand, this);
             gzmsg << "TVCPlugin input mode: transport_topic (legacy)" << std::endl;
             gzmsg << "  Topic: " << this->transport_topic_ << std::endl;
@@ -428,8 +437,13 @@ public:
             gzwarn << "Unknown input_mode: '" << this->input_mode_ << "'. Using 'joint_position'." << std::endl;
             this->servo_0_node_ = std::make_unique<transport::Node>();
             this->servo_1_node_ = std::make_unique<transport::Node>();
-            this->servo_0_node_->Subscribe(this->servo_0_topic_, &TVCPlugin::OnServo0Command, this);
-            this->servo_1_node_->Subscribe(this->servo_1_topic_, &TVCPlugin::OnServo1Command, this);
+            gzmsg << "[SUBSCRIBE] Fallback: Subscribing to Servo 0 topic: " << this->servo_0_topic_ << std::endl;
+            bool sub0_ok = this->servo_0_node_->Subscribe(this->servo_0_topic_, &TVCPlugin::OnServo0Command, this);
+            gzmsg << "[SUBSCRIBE] Servo 0 subscription result: " << (sub0_ok ? "SUCCESS" : "FAILED") << std::endl;
+            
+            gzmsg << "[SUBSCRIBE] Fallback: Subscribing to Servo 1 topic: " << this->servo_1_topic_ << std::endl;
+            bool sub1_ok = this->servo_1_node_->Subscribe(this->servo_1_topic_, &TVCPlugin::OnServo1Command, this);
+            gzmsg << "[SUBSCRIBE] Servo 1 subscription result: " << (sub1_ok ? "SUCCESS" : "FAILED") << std::endl;
         }
         
           gzmsg << "TVCPlugin configured for TVC model. Max Servo Speed: " << this->servo_max_speed_
@@ -519,6 +533,19 @@ public:
         // Use real gimbal kinematics with Levenberg-Marquardt solver
         double theta = 0.0;  // Roll angle (X axis)
         double phi = 0.0;    // Pitch angle (Y axis)
+        
+        // DEBUG: Log servo states before IK
+        static int debug_counter = 0;
+        if (debug_counter % 10 == 0)  // Log every 10 iterations to reduce spam
+        {
+            gzmsg << "[SERVO_DYNAMICS] Servo1(Pitch): Target=" << std::fixed << std::setprecision(6)
+                  << this->servo1_target_len_ << "m, Current=" << this->servo1_current_len_ 
+                  << "m, Vel=" << this->servo1_velocity_ << "m/s" << std::endl;
+            gzmsg << "[SERVO_DYNAMICS] Servo2(Roll):  Target=" << std::fixed << std::setprecision(6)
+                  << this->servo2_target_len_ << "m, Current=" << this->servo2_current_len_ 
+                  << "m, Vel=" << this->servo2_velocity_ << "m/s" << std::endl;
+        }
+        debug_counter++;
         
         // Call the inverse kinematics solver
         // Servo 1 (servo1_current_len_) controls pitch (L3)
@@ -678,30 +705,41 @@ public:
         current_len = std::clamp(current_len, this->servo_min_len_, this->servo_max_len_);
     }
 
+public:
     // Callback for PX4 Servo 0 command (Roll control)
     void OnServo0Command(const msgs::Double &_msg)
     {
+        static int call_count = 0;
+        call_count++;
+        
         // Extract normalized [-1, 1] input from PX4
         this->servo_0_command_ = _msg.data();
         
         // Convert input format to servo length target
         this->servo1_target_len_ = ConvertInputToServoLength(this->servo_0_command_, 0);
         
-        gzmsg << "TVCPlugin::OnServo0Command - input: " << this->servo_0_command_ 
-              << ", target_len: " << this->servo1_target_len_ << std::endl;
+        gzmsg << "[SERVO_0] CALLBACK TRIGGERED (#" << call_count << ") Input: " << std::fixed << std::setprecision(6)
+              << this->servo_0_command_ 
+              << " -> Target Length: " << this->servo1_target_len_ 
+              << " m" << std::endl;
     }
 
     // Callback for PX4 Servo 1 command (Pitch control)
     void OnServo1Command(const msgs::Double &_msg)
     {
+        static int call_count = 0;
+        call_count++;
+        
         // Extract normalized [-1, 1] input from PX4
         this->servo_1_command_ = _msg.data();
         
         // Convert input format to servo length target
         this->servo2_target_len_ = ConvertInputToServoLength(this->servo_1_command_, 1);
         
-        gzmsg << "TVCPlugin::OnServo1Command - input: " << this->servo_1_command_ 
-              << ", target_len: " << this->servo2_target_len_ << std::endl;
+        gzmsg << "[SERVO_1] CALLBACK TRIGGERED (#" << call_count << ") Input: " << std::fixed << std::setprecision(6)
+              << this->servo_1_command_ 
+              << " -> Target Length: " << this->servo2_target_len_ 
+              << " m" << std::endl;
     }
 
     // Helper: Convert input value (format-specific) to servo length target
@@ -816,11 +854,18 @@ public:
                             const EntityComponentManager &_ecm) override
     {
         // Publish computed angle setpoints to topics for JointPositionController to consume
+        static int publish_counter = 0;
         if (this->roll_angle_pub_)
         {
             msgs::Double roll_msg;
             roll_msg.set_data(this->last_roll_angle_);
             this->roll_angle_pub_->Publish(roll_msg);
+            
+            if (publish_counter % 10 == 0)
+            {
+                gzmsg << "[PUBLISH] Roll angle (servo_roll): " << std::fixed << std::setprecision(6)
+                      << this->last_roll_angle_ << " rad" << std::endl;
+            }
         }
         
         if (this->pitch_angle_pub_)
@@ -828,9 +873,20 @@ public:
             msgs::Double pitch_msg;
             pitch_msg.set_data(this->last_pitch_angle_);
             this->pitch_angle_pub_->Publish(pitch_msg);
+            
+            if (publish_counter % 10 == 0)
+            {
+                gzmsg << "[PUBLISH] Pitch angle (servo_pitch): " << std::fixed << std::setprecision(6)
+                      << this->last_pitch_angle_ << " rad" << std::endl;
+            }
         }
+        
+        publish_counter++;
     }
 
+public:
+    // Callback methods - these need to be public for transport subscribe to work
+    
 private:
     Model model_{kNullEntity};
     Entity roll_joint_{kNullEntity};
